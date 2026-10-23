@@ -1,0 +1,497 @@
+#!/bin/bash
+
+# disKover - Subdomain discovery by Brute Logic
+# Dependencies: curl, parallel, dnsutils (sudo apt install parallel dnsutils -y)
+# Usage: bash diskover <DOMAIN> [-j|--json]
+# Live subdomain discovery with optional JSON output
+
+# ---------------------------------------------------------------------------
+# CONFIG & ARGUMENTS
+# ---------------------------------------------------------------------------
+
+TOOL="disKover v1.0 by Brute Logic - https://brutelogic.net"
+JSON_MODE=false
+DOMAIN=""
+
+for arg in "$@"; do
+    case "$arg" in
+        -j|--json) JSON_MODE=true ;;
+        *) [[ -z "$DOMAIN" ]] && DOMAIN="$arg" ;;
+    esac
+done
+
+CONNECT_TIMEOUT=3
+MAX_TIME=5
+PARALLEL_JOBS=10
+PORTS="443 80 8443 8080 8000"   # keep 443 before 80: the :80 redirect-dedup needs 443 probed first
+MAX_RESULTS=5000
+
+PERM_WORDS="dev prod stg test uat old new internal admin api v1 v2"
+PERM_MAX=500
+
+WALK_MAX=1000
+WALK_TIME=10
+MINE_MAX_JS=10
+
+QUEUE=()
+MINED_LABELS=""
+
+declare -A SEEN
+declare -a OUT_LINES
+
+UA_LIST=(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+)
+
+export UA_STRING="$(IFS='|'; echo "${UA_LIST[*]}")"
+export DOMAIN CONNECT_TIMEOUT MAX_TIME
+export PORTS
+
+# ---------------------------------------------------------------------------
+# OUTPUT & DISPLAY
+# ---------------------------------------------------------------------------
+
+CYAN='\033[1;36m'
+MAGENTA='\033[1;35m'
+NC='\033[0m'
+
+header() {
+    echo ""
+    echo "$TOOL"
+    echo ""
+}
+
+usage() {
+    header
+    echo "Usage: bash diskover <DOMAIN> [-j|--json]"
+    echo ""
+    echo "Arguments:"
+    echo "  DOMAIN     Target domain (required)"
+    echo "  -j|--json  Output results in JSON format"
+    echo ""
+    echo "Examples:"
+    echo "  bash diskover example.com"
+    echo "  bash diskover example.com -j | jq"
+    echo ""
+    exit 1
+}
+
+print_result() {
+    local status="$1" host="$2" port="$3" ip="$4" cname="$5"
+    $JSON_MODE && return
+    local color="" out
+    case "$status" in
+        DNS) color="$CYAN" ;;
+        5??) color="$MAGENTA" ;;
+    esac
+    if [[ "$status" == "DNS" ]]; then out="${status} ${host}"; else out="${status} ${host}:${port}"; fi
+    [[ -n "$ip" ]] && out="${out} | ${ip}"
+    [[ -n "$cname" ]] && out="${out} | CNAME: ${cname}"
+    printf "${color}%s${NC}\n" "$out"
+}
+
+summary() {
+    local elapsed="$1" total="$2" live="$3" dns="$4"
+    echo ""
+    echo "Domain: $DOMAIN"
+    echo "Total: $total | live: $live | dns: $dns | Time: ${elapsed}s"
+}
+
+json_output() {
+    local elapsed="$1" total="$2" live="$3" dns="$4"
+    local hosts="" line status host port ip cname first=1 portval
+
+    # build the hosts array from collected result lines
+    for line in "${OUT_LINES[@]}"; do
+        IFS='|' read -r status host port ip cname <<< "$line"
+        portval="null"; [[ -n "$port" ]] && portval="$port"
+        [[ $first -eq 0 ]] && hosts+=","
+        first=0
+        hosts+=$(printf '{"host":"%s","ip":"%s","port":%s,"status":"%s","cname":"%s"}' \
+            "$(json_str "$host")" "$(json_str "$ip")" "$portval" "$(json_str "$status")" "$(json_str "$cname")")
+    done
+
+    printf '{"meta":{"tool":"%s","timestamp":"%s","target":"%s","hosts_total":%d,"hosts_live":%d,"hosts_dns":%d,"elapsed_time":%d},"hosts":[%s]}\n' \
+        "$TOOL" \
+        "$(LC_TIME=C date -u '+%d-%b-%Y %H:%M:%S UTC')" \
+        "$(json_str "$DOMAIN")" \
+        "$total" "$live" "$dns" "$elapsed" \
+        "$hosts"
+}
+
+# ---------------------------------------------------------------------------
+# WORDLIST — high probability subdomain prefixes
+# ---------------------------------------------------------------------------
+
+build_wordlist() {
+    local ROOTS=(
+        api dev staging test admin portal internal vpn mail smtp pop imap
+        ftp ssh remote access secure cdn static assets media images files
+        upload uploads download downloads backup old beta alpha preview
+        demo sandbox lab research support helpdesk status monitor health
+        metrics dashboard analytics log logs audit compliance legal privacy
+        shop store cart checkout payment billing invoice account accounts
+        auth login sso oauth identity user users profile members community
+        forum blog news docs documentation wiki help kb
+        mobile app web www m wap gateway proxy load balancer
+        ci cd jenkins gitlab github bitbucket jira confluence
+        db database mysql postgres redis mongo elastic search
+        dev1 dev2 stg1 stg2 test1 test2 uat qa prod production
+        corp intranet extranet partner partners vendor vendors
+        api1 api2 api3 v1 v2 v3
+    )
+    for root in "${ROOTS[@]}"; do echo "$root"; done
+}
+
+WORDLIST=()
+while IFS= read -r word; do
+    [[ -n "$word" ]] && WORDLIST+=("$word")
+done < <(build_wordlist | sort -u | shuf)
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+random_ua() {
+    echo "${UA_LIST[$RANDOM % ${#UA_LIST[@]}]}"
+}
+
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    echo "$s"
+}
+
+# Authoritative nameservers for the target zone (used by NSEC walk and AXFR)
+get_ns() {
+    dig +short +time=2 +tries=1 NS "$DOMAIN" 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort -u
+}
+
+# pull hostnames under the target domain out of arbitrary text (stdin)
+extract_subs() {
+    grep -oiE "([a-z0-9_-]+\.)+${DOMAIN//./\\.}" \
+        | tr '[:upper:]' '[:lower:]' | sed 's/^\*\.//' | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# PASSIVE
+# ---------------------------------------------------------------------------
+
+# Passive bonus (certificate transparency). Optional by nature: if the source
+# is down or rate-limited, the run continues unaffected.
+passive() {
+    local sub
+    while IFS= read -r sub; do
+        [[ -n "$sub" ]] && QUEUE+=("$sub")
+    done < <(
+        curl -s --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+            -A "$(random_ua)" "https://crt.sh/?q=%25.$DOMAIN&output=json" \
+            | grep -oP '"name_value":"\K[^"]+' \
+            | sed 's/\\n/\n/g' \
+            | extract_subs
+    )
+}
+
+# ---------------------------------------------------------------------------
+# WILDCARD DETECTION
+# ---------------------------------------------------------------------------
+
+wildcard_detect() {
+    local i rnd
+    WILD_IPS=""
+    for i in 1 2 3; do
+        rnd="dk-$(date +%s)-$RANDOM.$DOMAIN"
+        WILD_IPS+="$(dig +short A "$rnd" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')"$'\n'
+    done
+    WILD_IPS=$(printf '%s' "$WILD_IPS" | grep -vE '^$' | sort -u)
+    export WILD_IPS
+}
+
+# ---------------------------------------------------------------------------
+# BRUTE
+# ---------------------------------------------------------------------------
+
+brute() {
+    local word
+    for word in "${WORDLIST[@]}"; do
+        QUEUE+=("${word}.${DOMAIN}")
+    done
+}
+
+# ---------------------------------------------------------------------------
+# DNS EXTRA STAGES + MINING (filled in later steps)
+# ---------------------------------------------------------------------------
+
+# SRV service-record sweep: pull target hosts from common service records
+srv() {
+    local svc target names=()
+    local SRV_SERVICES="_sip._tcp _sips._tcp _sip._udp _sipfederationtls._tcp \
+        _xmpp-client._tcp _xmpp-server._tcp _ldap._tcp _kerberos._tcp _kerberos._udp \
+        _gc._tcp _autodiscover._tcp _caldav._tcp _caldavs._tcp _carddav._tcp _carddavs._tcp \
+        _imap._tcp _imaps._tcp _pop3._tcp _submission._tcp _smtp._tcp _stun._udp _turn._tcp"
+    for svc in $SRV_SERVICES; do names+=("${svc}.${DOMAIN}"); done
+    while IFS= read -r target; do
+        [[ -n "$target" ]] && QUEUE+=("$target")
+    done < <(
+        printf '%s\n' "${names[@]}" \
+        | parallel -j "$PARALLEL_JOBS" dig +short +time=2 +tries=1 SRV {} \
+        | awk '{print $NF}' | sed 's/\.$//' | grep -v '^$'
+    )
+}
+
+# NSEC/DNSSEC zone walk: follow the NSEC chain to enumerate every zone name
+# (NSEC3/hashed zones return no NSEC records, so the walk simply stops)
+nsec() {
+    local ns cur next count=0 start=$SECONDS
+    local -A seen
+    ns=$(get_ns | head -1)
+    [[ -z "$ns" ]] && return
+    cur="$DOMAIN"
+    while :; do
+        next=$(dig +dnssec +time=2 +tries=1 @"$ns" "$cur" NSEC 2>/dev/null \
+            | awk -v o="${cur}." '$1==o && $4=="NSEC"{print $5; exit}')
+        next=${next%.}
+        [[ -z "$next" ]] && break
+        [[ "$next" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*$ ]] || break
+        [[ "$next" == "$DOMAIN" ]] && break
+        [[ -n "${seen[$next]}" ]] && break
+        seen[$next]=1
+        QUEUE+=("$next")
+        cur="$next"
+        count=$((count+1))
+        [[ "$count" -ge "$WALK_MAX" ]] && break
+        [[ $(( SECONDS - start )) -ge "$WALK_TIME" ]] && break
+    done
+}
+
+# AXFR: try a zone transfer against each authoritative NS (usually refused,
+# but a misconfigured server hands over the entire zone)
+axfr() {
+    local ns name
+    while IFS= read -r ns; do
+        [[ -z "$ns" ]] && continue
+        while IFS= read -r name; do
+            [[ -n "$name" ]] && QUEUE+=("$name")
+        done < <(
+            dig +time=3 +tries=1 @"$ns" "$DOMAIN" AXFR 2>/dev/null \
+            | awk '$1 ~ /\.$/{print $1}' | sed 's/\.$//' | sort -u | head -n "$MAX_RESULTS"
+        )
+    done < <(get_ns)
+}
+
+# Apex content/header mining: pull sub references from the main site's HTML,
+# CSP and Alt-Svc headers, robots.txt, sitemap.xml and referenced JS (depth 1)
+mine() {
+    local entry ua resp js jsurl jshost found subs acc=""
+
+    for entry in "$DOMAIN" "www.$DOMAIN"; do
+        ua="$(random_ua)"
+
+        # page with headers (CSP / Alt-Svc) and body links
+        resp=$(curl -sk -i -A "$ua" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" "https://${entry}/")
+        [[ -n "$resp" ]] && acc+=$'\n'"$(printf '%s' "$resp" | extract_subs)"
+
+        # robots.txt and sitemap.xml
+        acc+=$'\n'"$(curl -sk -A "$ua" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" "https://${entry}/robots.txt" | extract_subs)"
+        acc+=$'\n'"$(curl -sk -A "$ua" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" "https://${entry}/sitemap.xml" | extract_subs)"
+
+        # JS files referenced on the page, capped at MINE_MAX_JS
+        while IFS= read -r js; do
+            [[ -z "$js" ]] && continue
+            case "$js" in
+                http*) jsurl="$js" ;;
+                //*)   jsurl="https:$js" ;;
+                /*)    jsurl="https://${entry}${js}" ;;
+                *)     jsurl="https://${entry}/${js}" ;;
+            esac
+            # resolve the real authority (strip scheme, path, userinfo, port) then scope-check
+            jshost="${jsurl#*://}"; jshost="${jshost%%/*}"; jshost="${jshost##*@}"; jshost="${jshost%%:*}"
+            [[ "$jshost" == "$DOMAIN" || "$jshost" == *".$DOMAIN" ]] || continue
+            acc+=$'\n'"$(curl -sk -A "$ua" --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" "$jsurl" | extract_subs)"
+        done < <(printf '%s' "$resp" | grep -oiE '(src|href)=["'\''][^"'\'' >]+\.js' | sed -E 's/^(src|href)=["'\'']//I' | head -n "$MINE_MAX_JS")
+    done
+
+    # enqueue what was found and feed the labels to the permutation pool
+    subs=$(printf '%s\n' "$acc" | grep -v '^$' | sort -u)
+    [[ -z "$subs" ]] && return
+    while IFS= read -r found; do
+        QUEUE+=("$found")
+        MINED_LABELS+=" ${found%%.*}"
+    done <<< "$subs"
+    MINED_LABELS=$(printf '%s' "$MINED_LABELS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+}
+
+# ---------------------------------------------------------------------------
+# PERMUTE — combine discovered subs with affix words (phase 2)
+# ---------------------------------------------------------------------------
+
+permute() {
+    local resolved="$1" sub w subs words out=() known filtered
+
+    # discovered sub-labels (host minus .DOMAIN), apex excluded
+    subs=$(printf '%s\n' "$resolved" | cut -d'|' -f1 \
+        | sed "s/\.${DOMAIN//./\\.}\$//" | grep -vxF "$DOMAIN" | sort -u)
+    [[ -z "$subs" ]] && return
+
+    # affix pool = fixed words + labels discovered by mining
+    words="$PERM_WORDS $MINED_LABELS"
+    while IFS= read -r sub; do
+        [[ -z "$sub" ]] && continue
+        for w in $words; do
+            [[ "$sub" == "$w" ]] && continue
+            out+=("${sub}-${w}.${DOMAIN}")
+            out+=("${w}-${sub}.${DOMAIN}")
+            out+=("${w}.${sub}.${DOMAIN}")
+            out+=("${sub}${w}.${DOMAIN}")
+        done
+    done <<< "$subs"
+
+    # dedup, drop names already found in phase 1, cap at PERM_MAX
+    filtered=$(printf '%s\n' "${out[@]}" | sort -u)
+    known=$(printf '%s\n' "$resolved" | cut -d'|' -f1 | grep -v '^$')
+    [[ -n "$known" ]] && filtered=$(grep -vxF -f <(printf '%s\n' "$known") <<< "$filtered")
+    printf '%s\n' "$filtered" | head -n "$PERM_MAX"
+}
+
+# ---------------------------------------------------------------------------
+# RESOLVE — existence gate (resolves + wildcard filter)
+# ---------------------------------------------------------------------------
+
+normalize() {
+    tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/\.$//' -e 's/^\*\.//' \
+        | grep -E '^[a-z0-9._-]+$' \
+        | grep -vE '(^|\.)-' \
+        | grep -E "(^|\.)${DOMAIN//./\\.}$" \
+        | sort -u
+}
+
+resolve_one() {
+    local host="$1" ip cname
+    cname=$(dig +short +time=2 +tries=2 CNAME "$host" 2>/dev/null | head -1 | sed 's/\.$//')
+    [[ "$cname" =~ ^[a-zA-Z0-9._-]*$ ]] || cname=""
+    ip=$(dig +short +time=2 +tries=2 A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort | head -1)
+    [[ -z "$ip" && -z "$cname" ]] && return
+    [[ -n "$ip" && -n "$WILD_IPS" ]] && grep -qxF "$ip" <<< "$WILD_IPS" && return
+    echo "${host}|${ip}|${cname}"
+}
+export -f resolve_one
+export WILD_IPS
+
+resolve() {
+    printf '%s\n' "${QUEUE[@]}" \
+        | normalize \
+        | parallel --env resolve_one -j "$PARALLEL_JOBS" resolve_one {} \
+        | sort -u \
+        | head -n "$MAX_RESULTS"
+}
+
+# ---------------------------------------------------------------------------
+# PROBE
+# ---------------------------------------------------------------------------
+
+# TCP preflight: true if a connection to host:port opens
+tcp_open() { timeout "$CONNECT_TIMEOUT" bash -c 'true > "/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
+
+# Probe one resolved host: emit a live line per answering web port,
+# or a single DNS line if it resolves but serves no web
+probe_host() {
+    local rec="$1" host ip cname
+    IFS='|' read -r host ip cname <<< "$rec"
+    local live=0 https_live=0 port proto code ua
+    IFS='|' read -ra uas <<< "$UA_STRING"
+
+    # only try web ports when we have an IP to connect to
+    if [[ -n "$ip" ]]; then
+        for port in $PORTS; do
+            tcp_open "$host" "$port" || continue
+
+            # Protocol
+            proto="http"; [[ "$port" == "443" || "$port" == "8443" ]] && proto="https"
+
+            # HTTP status
+            ua="${uas[$RANDOM % ${#uas[@]}]}"
+            code=$(curl -sk -o /dev/null -w "%{http_code}" \
+                --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --max-redirs 0 \
+                -A "$ua" "${proto}://${host}:${port}")
+            [[ -z "$code" || "$code" == "000" ]] && continue
+
+            # drop :80 when it just redirects to a live :443
+            [[ "$port" == "80" && "$https_live" -eq 1 && "$code" =~ ^3 ]] && continue
+
+            echo "${code}|${host}|${port}|${ip}|${cname}"
+            live=1
+            [[ "$port" == "443" ]] && https_live=1
+        done
+    fi
+
+    # resolves but no live web service -> DNS line
+    [[ "$live" -eq 0 ]] && echo "DNS|${host}||${ip}|${cname}"
+}
+export -f tcp_open probe_host
+
+# ---------------------------------------------------------------------------
+# SCAN
+# ---------------------------------------------------------------------------
+
+scan() {
+    local resolved="$1" line status host port ip cname key
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS='|' read -r status host port ip cname <<< "$line"
+        key="${host}:${port}:${status}"
+        [[ "${SEEN[$key]+x}" ]] && continue
+        SEEN["$key"]=1
+        OUT_LINES+=("$line")
+        print_result "$status" "$host" "$port" "$ip" "$cname"
+    done < <(printf '%s\n' "$resolved" | grep -v '^$' | parallel --env probe_host -j "$PARALLEL_JOBS" probe_host {})
+}
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+main() {
+    [[ -z "$DOMAIN" ]] && usage
+    [[ "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || usage
+    START_TIME=$SECONDS
+    $JSON_MODE || header
+    wildcard_detect
+
+    # Phase 1: independent discovery (+ apex content mining)
+    QUEUE+=("$DOMAIN")
+    passive
+    brute
+    srv
+    nsec
+    axfr
+    mine
+    local hosts1; hosts1=$(resolve)
+
+    # Phase 2: permutations of what phase 1 found
+    QUEUE=()
+    mapfile -t QUEUE < <(permute "$hosts1")
+    local hosts2; hosts2=$(resolve)
+
+    # combine everything discovered and probe it
+    local resolved; resolved=$(printf '%s\n%s\n' "$hosts1" "$hosts2" | grep -v '^$' | sort -u)
+    scan "$resolved"
+
+    local elapsed=$(( SECONDS - START_TIME ))
+
+    # host-level counts: total = resolved hosts, dns = hosts with no live port
+    local total=0 dns=0 live=0 l
+    [[ -n "$resolved" ]] && total=$(grep -c . <<< "$resolved")
+    for l in "${OUT_LINES[@]}"; do [[ "$l" == DNS\|* ]] && dns=$((dns+1)); done
+    live=$(( total - dns ))
+
+    $JSON_MODE && json_output "$elapsed" "$total" "$live" "$dns" || summary "$elapsed" "$total" "$live" "$dns"
+}
+
+main
